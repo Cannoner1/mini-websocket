@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>语音实时发送</title>
+    <style>
+        body { display: flex; flex-direction: column; align-items: center; margin-top: 100px; font-size: 20px; }
+        button { width: 200px; height: 80px; font-size: 24px; margin: 20px; border: none; border-radius: 10px; cursor: pointer; }
+        #startBtn { background-color: #4CAF50; color: white; }
+        #stopBtn { background-color: #f44336; color: white; display: none; }
+        #status { margin-top: 20px; color: #666; }
+        #inputBox {
+            width: 300px;
+            padding: 8px;
+            margin-right: 10px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+        }
+        #getBtn {
+            padding: 8px 16px;
+            background: #0088ff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        #result {
+            margin-top: 20px;
+            color: #333;
+        }
+    </style>
+</head>
+
+<body>
+    <button id="startBtn">开始录制并发送</button>
+    <button id="stopBtn">停止发送</button>
+    <div id="status">状态：未连接</div>
+    <!-- 输入框 -->
+    <input type="text" id="inputBox" placeholder="请输入设备号（数字）...">
+    <!-- 触发按钮 -->
+    <button id="getBtn">确认设备号</button>
+    <!-- 展示获取的结果 -->
+    <div id="result"></div>
+
+    <script>
+        // ========== 核心配置项 ==========
+        const LUBANCAT_IP = "8.137.101.41"; // 鲁班猫固定IP
+        const BASE_PORT = 6200; // 端口基数
+        // 音频采集优化配置（对齐后端处理要求）
+        const AUDIO_CONFIG = {
+            mimeType: 'audio/webm; codecs=opus', // 强制编码格式
+            sampleRate: 16000, // 采样率（和后端一致）
+            channelCount: 1, // 单声道
+            chunkSize: 500, // 分片大小（增大到500ms，减少碎片化）
+            bitrate: 48000 // 码率（平衡音质和大小）
+        };
+
+        // ========== 全局变量（修正声明） ==========
+        let mediaRecorder = null;
+        let mediaStream = null;
+        let ws = null;
+        let isRecording = false;
+        let inputValue = 0; // 设备号
+        let targetPort = 0; // 最终连接端口
+
+        // ========== DOM元素（修正声明） ==========
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const status = document.getElementById('status');
+        const inputBox = document.getElementById('inputBox');
+        const getBtn = document.getElementById('getBtn');
+        const result = document.getElementById('result');
+
+        // ========== 初始化检测 ==========
+        // 检测浏览器是否支持MediaRecorder
+        if (!window.MediaRecorder) {
+            status.textContent = "状态：当前浏览器不支持音频录制，请更换Chrome/Firefox/Edge新版浏览器";
+            startBtn.disabled = true;
+            getBtn.disabled = true;
+        }
+
+        // ========== 工具函数：检测支持的音频格式 ==========
+        function checkSupportedMimeType() {
+            const supportedMimeTypes = [
+                'audio/webm; codecs=opus',
+                'audio/webm',
+                'audio/ogg; codecs=opus',
+                'audio/ogg'
+            ];
+            for (const mimeType of supportedMimeTypes) {
+                if (MediaRecorder.isTypeSupported(mimeType)) {
+                    return mimeType;
+                }
+            }
+            throw new Error("浏览器不支持WebM/Opus格式，无法正常采集音频");
+        }
+
+        // ========== 事件绑定 ==========
+        // 开始录制按钮
+        startBtn.addEventListener('click', async () => {
+            if (isRecording || !window.MediaRecorder) return;
+            // 检查是否已选择设备号
+            if (targetPort === 0) {
+                status.textContent = "状态：请先点击「确认设备号」输入有效数字！";
+                return;
+            }
+            try {
+                await initWebSocket(); // 初始化WSS连接
+                await startAudioRecord(); // 启动音频采集
+                updateUI(true); // 更新按钮状态
+            } catch (err) {
+                status.textContent = `状态：启动失败 - ${err.message}`;
+                closeWebSocket();
+                updateUI(false);
+            }
+        });
+
+        // 停止录制按钮
+        stopBtn.addEventListener('click', () => {
+            if (!isRecording) return;
+            stopAudioRecord(); // 停止音频采集
+            closeWebSocket(); // 关闭WSS连接
+            updateUI(false); // 更新按钮状态
+            status.textContent = "状态：已停止录制和发送";
+        });
+
+        // 确认设备号按钮
+        getBtn.addEventListener('click', function() {
+            // 获取并校验输入值
+            const inputVal = inputBox.value.trim();
+            if (inputVal === '' || isNaN(inputVal)) {
+                result.innerText = '请输入有效的数字设备号！';
+                result.style.color = 'red';
+                targetPort = 0;
+                return;
+            }
+
+            // 计算目标端口
+            inputValue = parseInt(inputVal);
+            targetPort = BASE_PORT + inputValue;
+            result.innerText = `已选择设备号：${inputValue}，连接端口：${targetPort}`;
+            result.style.color = 'green';
+            status.textContent = `状态：设备号已确认，可点击「开始录制并发送」`;
+
+            // 清空输入框（可选）
+            // inputBox.value = '';
+        });
+
+        // 回车键确认设备号
+        inputBox.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') {
+                getBtn.click();
+            }
+        });
+
+        // ========== WebSocket相关 ==========
+        // 初始化WSS连接（带重连和错误处理）
+        async function initWebSocket() {
+            return new Promise((resolve, reject) => {
+                // 关闭原有连接
+                if (ws) {
+                    ws.close();
+                }
+
+                // 构建WSS连接地址
+                const WS_URL = `wss://${LUBANCAT_IP}:${targetPort}`;
+                ws = new WebSocket(WS_URL);
+
+                // 连接成功
+                ws.onopen = () => {
+                    status.textContent = `状态：已连接鲁班猫4 (${LUBANCAT_IP}:${targetPort})`;
+                    resolve();
+                };
+
+                // 连接错误
+                ws.onerror = (err) => {
+                    status.textContent = `状态：连接失败(${LUBANCAT_IP}:${targetPort})，请检查服务是否启动`;
+                    reject(new Error(`WSS连接失败：${err.message}`));
+                };
+
+                // 连接关闭
+                ws.onclose = (e) => {
+                    if (e.code !== 1000 && isRecording) {
+                        status.textContent = `状态：连接异常断开，正在尝试重连...`;
+                        // 自动重连（仅录制中）
+                        setTimeout(() => initWebSocket(), 3000);
+                    } else if (!isRecording) {
+                        status.textContent = `状态：与鲁班猫4的连接已关闭`;
+                    }
+                };
+            });
+        }
+
+        // 关闭WebSocket连接
+        function closeWebSocket() {
+            if (ws) {
+                ws.close(1000, '用户主动停止发送');
+                ws = null;
+            }
+        }
+
+        // ========== 音频采集相关（核心优化） ==========
+        // 开始音频采集
+        async function startAudioRecord() {
+            // 1. 获取麦克风媒体流（强制指定参数）
+            mediaStream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    channelCount: { exact: AUDIO_CONFIG.channelCount }, // 强制单声道
+                    sampleRate: { ideal: AUDIO_CONFIG.sampleRate }, // 优先16000Hz
+                    echoCancellation: true, // 回声消除
+                    noiseSuppression: true, // 降噪
+                    autoGainControl: false, // 关闭自动增益（避免音量波动）
+                    highpassFilter: false // 关闭高音过滤
+                }
+            });
+
+            // 2. 校验媒体流有效性
+            const audioTracks = mediaStream.getAudioTracks();
+            if (!mediaStream || audioTracks.length === 0) {
+                throw new Error("未获取到有效的麦克风音频流");
+            }
+
+            // 3. 确认浏览器支持的音频格式
+            const supportedMimeType = checkSupportedMimeType();
+
+            // 4. 构造MediaRecorder（带明确配置）
+            mediaRecorder = new MediaRecorder(mediaStream, {
+                mimeType: supportedMimeType,
+                audioBitsPerSecond: AUDIO_CONFIG.bitrate
+            });
+
+            // 5. 实时发送音频分片（优化逻辑）
+            mediaRecorder.ondataavailable = (e) => {
+                if (e.data.size > 0 && ws?.readyState === WebSocket.OPEN) {
+                    ws.send(e.data); // 发送音频数据
+                }
+            };
+
+            // 6. 录制错误处理
+            mediaRecorder.onerror = (err) => {
+                throw new Error(`音频录制错误：${err.message}`);
+            };
+
+            // 7. 开始录制（使用优化的分片大小）
+            mediaRecorder.start(AUDIO_CONFIG.chunkSize);
+            isRecording = true;
+
+            // 8. 更新状态提示
+            status.textContent = `状态：正在录制并发送语音（格式：${supportedMimeType} | 端口：${targetPort}）`;
+        }
+
+        // 停止音频采集（完善资源释放）
+        function stopAudioRecord() {
+            if (isRecording) {
+                // 停止录制
+                if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                    mediaRecorder.stop();
+                }
+                // 释放媒体流（避免麦克风占用）
+                if (mediaStream) {
+                    mediaStream.getTracks().forEach(track => track.stop());
+                    mediaStream = null;
+                }
+                // 重置变量
+                mediaRecorder = null;
+                isRecording = false;
+            }
+        }
+
+        // ========== UI更新 ==========
+        function updateUI(isStart) {
+            isRecording = isStart;
+            startBtn.style.display = isStart ? 'none' : 'block';
+            stopBtn.style.display = isStart ? 'block' : 'none';
+        }
+
+        // ========== 页面清理 ==========
+        // 页面关闭/刷新时释放资源
+        window.addEventListener('beforeunload', () => {
+            if (isRecording) {
+                stopAudioRecord();
+                closeWebSocket();
+            }
+        });
+    </script>
+</body>
+</html>
